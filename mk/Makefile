@@ -5,7 +5,7 @@ IMPORT_BRANDING := yes
 include $(B_BASE)/common.mk
 include $(B_BASE)/rpmbuild.mk
 
-REPO                   = $(call hg_loc,xen-api)
+REPO                   = $(call gitloc,xen-api)
 
 STAGING                = $(REPO)/dist/staging
 OUTPUT_XAPI            = $(MY_MAIN_PACKAGES)/xapi.tar.bz2
@@ -45,7 +45,10 @@ $(MY_SOURCES)/MANIFEST: $(MY_SOURCES_DIRSTAMP) $(OUTPUT_XAPI_SRC)
 	echo api gpl file $(JQUERY_TV_DIST) >> $@
 
 $(OUTPUT_XAPI_SRC):
-	cd $(REPO) && hg archive -t tbz2 $(HG_EXCLUDE) $@
+	if cd $(REPO); then \
+		while ! [ -d .git ]; do cd ..; done; \
+		git archive --prefix=$$(echo $@ | sed -r "s/([^/]*\/)*([^./]*)(.[^./]*)*/\2\//") --format=tar HEAD | bzip2 -z > $@; \
+	fi; # git archive in xen-api/mk/Makefile
 
 $(OUTPUT_CLI_RT) $(OUTPUT_SDK): $(MY_MAIN_PACKAGES)/.dirstamp $(RPM_DIRECTORIES)
 	$(MAKE) clean
