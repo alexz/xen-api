@@ -227,6 +227,22 @@ let update_ha_restart_priority = {
 		List.iter update_vm all_vms
 }
 
+let upgrade_cpu_flags = {
+	description = "Upgrading last_boot_CPU flags for all running VMs";
+	version = (fun x -> x <= cowley);
+	fn = fun ~__context ->
+		let should_update_vm vm =
+			let power_state = Db.VM.get_power_state ~__context ~self:vm in
+			List.mem power_state [`Running; `Suspended]
+		in
+		let all_vms = Db.VM.get_all ~__context in
+		let vms_to_update = List.filter should_update_vm all_vms in
+		let pool = Helpers.get_pool ~__context in
+		let master = Db.Pool.get_master ~__context ~self:pool in
+		List.iter (fun vm -> Xapi_vm_helpers.populate_cpu_flags ~__context ~vm ~host:master)
+			vms_to_update
+}
+
 let rules = [
 	upgrade_vm_memory_overheads;
 	upgrade_wlb_configuration;
@@ -235,6 +251,7 @@ let rules = [
 	update_snapshots;
 	update_vdi_types;
 	update_ha_restart_priority;
+	upgrade_cpu_flags;
 ]
 
 (* Maybe upgrade most recent db *)
