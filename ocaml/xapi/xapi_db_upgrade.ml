@@ -218,7 +218,7 @@ let update_ha_restart_priority = {
 			| "1" -> ("restart", 1L)
 			| "2" -> ("restart", 2L)
 			| "3" -> ("restart", 3L)
-			| "best-effort" -> ("best_effort", 0L)
+			| "best-effort" -> ("best-effort", 0L)
 			| _ -> ("", 0L)
 			in
 			Db.VM.set_ha_restart_priority ~__context ~self:vm ~value:new_priority;
