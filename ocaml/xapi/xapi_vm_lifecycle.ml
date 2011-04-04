@@ -202,6 +202,12 @@ let report_concurrent_operations_error ~current_ops ~ref_str =
 	in
 	Some (Api_errors.other_operation_in_progress,["VM." ^ current_ops_str; ref_str])
 
+(* Suspending, checkpointing and live-migrating are not (yet) allowed if a PCI device is passed through *)
+let check_pci ~op ~ref_str =
+	match op with
+	|`suspend | `checkpoint | `pool_migrate -> Some (Api_errors.vm_has_pci_attached, [ref_str])
+	| _ -> None
+
 (** Take an internal VM record and a proposed operation, return true if the operation
     would be acceptable *)
 let check_operation_error ~__context ~vmr ~vmgmr ~ref ~clone_suspended_vm_enabled vdis_reset_and_caching ~op =
@@ -313,7 +319,13 @@ let check_operation_error ~__context ~vmr ~vmgmr ~ref ~clone_suspended_vm_enable
 			else None
 
 		else None) in
-	
+
+	(* If a PCI device is passed-through, check if the operation is allowed *)
+	let current_error = check current_error (fun () ->
+		if vmr.Db_actions.vM_attached_PCIs <> []
+		then check_pci ~op ~ref_str
+		else None) in
+
 	current_error
 
 let maybe_get_guest_metrics ~__context ~ref =
@@ -390,6 +402,14 @@ let force_state_reset ~__context ~self ~value:state =
 				 Db.VIF.set_currently_attached ~__context ~self:vif ~value:false;
 				 Db.VIF.set_reserved ~__context ~self:vif ~value:false)
 			(Db.VM.get_VIFs ~__context ~self);
+		List.iter 
+			(fun vgpu ->
+				 Db.VGPU.set_currently_attached ~__context ~self:vgpu ~value:false)
+			(Db.VM.get_VGPUs ~__context ~self);
+		List.iter
+			(fun pci ->
+				Db.PCI.remove_attached_VMs ~__context ~self:pci ~value:self)
+			(Db.VM.get_attached_PCIs ~__context ~self);
 		Db.VM.set_resident_on ~__context ~self ~value:Ref.null;
 		(* make sure we aren't reserving any memory for this VM *)
 		Db.VM.set_scheduled_to_be_resident_on ~__context ~self ~value:Ref.null

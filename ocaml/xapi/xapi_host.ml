@@ -245,7 +245,7 @@ let compute_evacuation_plan_no_wlb ~__context ~host =
   let pool = Helpers.get_pool ~__context in
   let protected_vms, unprotected_vms = 
     if Db.Pool.get_ha_enabled ~__context ~self:pool
-    then List.partition (fun (vm, record) -> Helpers.vm_should_always_run record.API.vM_ha_always_run record.API.vM_ha_restart_priority) all_user_vms
+    then List.partition (fun (vm, record) -> Helpers.vm_should_always_run record.API.vM_power_state record.API.vM_ha_restart_priority) all_user_vms
     else all_user_vms, [] in
   List.iter (fun (vm, _) -> Hashtbl.replace plans vm (Error (Api_errors.host_not_enough_free_memory, [ Ref.string_of vm ]))) unprotected_vms;
   let migratable_vms, unmigratable_vms = List.partition (fun (vm, record) ->
@@ -553,7 +553,7 @@ let is_host_alive ~__context ~host =
     false
   end
 
-let create ~__context ~uuid ~name_label ~name_description ~hostname ~address ~external_auth_type ~external_auth_service_name ~external_auth_configuration ~license_params ~edition ~license_server =
+let create ~__context ~uuid ~name_label ~name_description ~hostname ~address ~external_auth_type ~external_auth_service_name ~external_auth_configuration ~license_params ~edition ~license_server ~local_cache_sr =
 
   let existing_host = try Some (Db.Host.get_by_uuid __context uuid) with _ -> None in
   let make_new_metrics_object ref =
@@ -579,6 +579,7 @@ let create ~__context ~uuid ~name_label ~name_description ~hostname ~address ~ex
     ~capabilities:[]
     ~cpu_configuration:[]   (* !!! FIXME hard coding *)
     ~cpu_info:[]
+	~chipset_info:[]
     ~memory_overhead:0L
     ~sched_policy:"credit"  (* !!! FIXME hard coding *)
     ~supported_bootloaders:(List.map fst Xapi_globs.supported_bootloaders)
@@ -593,7 +594,7 @@ let create ~__context ~uuid ~name_label ~name_description ~hostname ~address ~ex
     ~bios_strings:[]
     ~power_on_mode:""
     ~power_on_config:[]
-	  ~local_cache_sr:Ref.null
+    ~local_cache_sr
   ;
   (* If the host we're creating is us, make sure its set to live *)
   Db.Host_metrics.set_last_updated ~__context ~self:metrics ~value:(Date.of_float (Unix.gettimeofday ()));
@@ -736,6 +737,10 @@ let management_reconfigure ~__context ~pif =
   if Db.Pool.get_ha_enabled ~__context ~self:pool 
   then raise (Api_errors.Server_error(Api_errors.ha_is_enabled, []));
 
+  (* Plugging a bond slave is not allowed *)
+  if Db.PIF.get_bond_slave_of ~__context ~self:pif <> Ref.null then
+    raise (Api_errors.Server_error (Api_errors.cannot_plug_bond_slave, [Ref.string_of pif]));
+    
   let net = Db.PIF.get_network ~__context ~self:pif in
   let bridge = Db.Network.get_bridge ~__context ~self:net in
 

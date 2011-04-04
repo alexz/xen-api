@@ -298,6 +298,17 @@ let rec create_or_get_host_on_master __context rpc session_id (host_ref, host) :
 		try Client.Host.get_by_uuid rpc session_id my_uuid
 		with _ ->
 			debug "Found no host with uuid = '%s' on the master, so creating one." my_uuid;
+
+			(* CA-51925: Copy the local cache SR *)
+			let my_local_cache_sr = Db.Host.get_local_cache_sr ~__context ~self:host_ref in
+			let local_cache_sr = if my_local_cache_sr = Ref.null then Ref.null else
+				begin
+					let my_local_cache_sr_rec = Db.SR.get_record ~__context ~self:my_local_cache_sr in
+					debug "Copying the local cache SR (uuid=%s)" my_local_cache_sr_rec.API.sR_uuid;
+					create_or_get_sr_on_master __context rpc session_id (my_local_cache_sr, my_local_cache_sr_rec)
+				end in
+
+			debug "Creating host object on master";
 			let ref = Client.Host.create ~rpc ~session_id
 				~uuid:my_uuid
 				~name_label:host.API.host_name_label
@@ -309,22 +320,34 @@ let rec create_or_get_host_on_master __context rpc session_id (host_ref, host) :
 				~external_auth_configuration:host.API.host_external_auth_configuration
 				~license_params:host.API.host_license_params
 				~edition:host.API.host_edition
-				~license_server:host.API.host_license_server in
+				~license_server:host.API.host_license_server 
+				(* CA-51925: local_cache_sr can only be written by Host.enable_local_caching_sr but this API
+				 * call is forwarded to the host in question. Since, during a pool-join, the host is offline,
+				 * we need an alternative way of preserving the value of the local_cache_sr field, so it's
+				 * been added to the constructor. *)
+				~local_cache_sr
+			in
 
 			(* Copy other-config into newly created host record: *)
 			no_exn (fun () -> Client.Host.set_other_config ~rpc ~session_id ~self:ref ~value:host.API.host_other_config) ();
 
 			(* Copy the crashdump SR *)
 			let my_crashdump_sr = Db.Host.get_crash_dump_sr ~__context ~self:host_ref in
-			let my_crashdump_sr_rec = Db.SR.get_record ~__context ~self:my_crashdump_sr in
-			let crashdump_sr = create_or_get_sr_on_master __context rpc session_id (my_crashdump_sr, my_crashdump_sr_rec) in
-			no_exn (fun () -> Client.Host.set_suspend_image_sr ~rpc ~session_id ~self:ref ~value:crashdump_sr) ();
+			if my_crashdump_sr <> Ref.null then begin
+				let my_crashdump_sr_rec = Db.SR.get_record ~__context ~self:my_crashdump_sr in
+                        	debug "Copying the crashdump SR (uuid=%s)" my_crashdump_sr_rec.API.sR_uuid;
+				let crashdump_sr = create_or_get_sr_on_master __context rpc session_id (my_crashdump_sr, my_crashdump_sr_rec) in
+				no_exn (fun () -> Client.Host.set_crash_dump_sr ~rpc ~session_id ~self:ref ~value:crashdump_sr) ()
+			end;
 
 			(* Copy the suspend image SR *)
 			let my_suspend_image_sr = Db.Host.get_crash_dump_sr ~__context ~self:host_ref in
-			let my_suspend_image_sr_rec = Db.SR.get_record ~__context ~self:my_suspend_image_sr in
-			let syspend_image_sr = create_or_get_sr_on_master __context rpc session_id (my_suspend_image_sr, my_suspend_image_sr_rec) in
-			no_exn (fun () -> Client.Host.set_crash_dump_sr ~rpc ~session_id ~self:ref ~value:my_suspend_image_sr) ();
+			if my_suspend_image_sr <> Ref.null then begin
+				let my_suspend_image_sr_rec = Db.SR.get_record ~__context ~self:my_suspend_image_sr in
+                        	debug "Copying the suspend-image SR (uuid=%s)" my_suspend_image_sr_rec.API.sR_uuid;
+				let suspend_image_sr = create_or_get_sr_on_master __context rpc session_id (my_suspend_image_sr, my_suspend_image_sr_rec) in
+				no_exn (fun () -> Client.Host.set_suspend_image_sr ~rpc ~session_id ~self:ref ~value:suspend_image_sr) ()
+			end;
 
 			ref in
 
@@ -496,7 +519,10 @@ let create_or_get_secret_on_master __context rpc session_id (secret_ref, secret)
 
 let protect_exn f x =
 	try Some (f x)
-	with _ -> None
+	with e ->
+		log_backtrace ();
+		debug "Ignoring exception: %s" (Printexc.to_string e);
+		None
 
 (* Remark: the order in which we create the object in the distant database is not very important, as we have *)
 (* an unique way to identify each object and thus we know if we need to create them or if it is already done *)
@@ -1060,7 +1086,7 @@ let ha_compute_hypothetical_max_host_failures_to_tolerate ~__context ~configurat
 	       if not(List.mem pri Constants.ha_valid_restart_priorities)
 	       then raise (Api_errors.Server_error(Api_errors.invalid_value, [ "ha_restart_priority"; pri ]))) configuration;
 
-  let protected_vms = List.map fst (List.filter (fun (vm, priority) -> Helpers.vm_should_always_run true priority) configuration) in
+  let protected_vms = List.map fst (List.filter (fun (vm, priority) -> Helpers.vm_should_always_run `Running priority) configuration) in
   let protected_vms = List.map (fun vm -> vm, Db.VM.get_record ~__context ~self:vm) protected_vms in
   Xapi_ha_vm_failover.compute_max_host_failures_to_tolerate ~__context ~protected_vms ()
 
@@ -1448,7 +1474,7 @@ let enable_redo_log ~__context ~sr =
 	(* enable the new redo log, unless HA is enabled (which means a redo log
 	 * is already in use) *)
 	if not (Db.Pool.get_ha_enabled ~__context ~self:pool) then begin
-		Redo_log.enable Xapi_globs.gen_metadata_vdi_reason;
+		Redo_log.enable Xapi_ha.ha_redo_log Xapi_globs.gen_metadata_vdi_reason;
 		Localdb.put Constants.redo_log_enabled "true"
 	end;
 	info "The redo log is now enabled"
@@ -1460,8 +1486,8 @@ let disable_redo_log ~__context =
 	let pool = Helpers.get_pool ~__context in
 	Db.Pool.set_redo_log_enabled ~__context ~self:pool ~value:false;
 	if not (Db.Pool.get_ha_enabled ~__context ~self:pool) then begin		
-		Redo_log_usage.stop_using_redo_log ();
-		Redo_log.disable ();
+		Redo_log_usage.stop_using_redo_log Xapi_ha.ha_redo_log;
+		Redo_log.disable Xapi_ha.ha_redo_log;
 		
 		(* disable static-ness of the VDI and clear local-DB flags *)
 		let vdi = Db.Pool.get_redo_log_vdi ~__context ~self:pool in

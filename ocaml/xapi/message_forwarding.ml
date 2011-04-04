@@ -393,6 +393,14 @@ module Forward = functor(Local: Custom_actions.CUSTOM_ACTIONS) -> struct
 			Ref.string_of vm
 		with _ -> "invalid"
 
+	let vm_appliance_uuid ~__context vm_appliance =
+		try if Pool_role.is_master () then
+			let name = Db.VM_appliance.get_name_label __context vm_appliance in
+			Printf.sprintf "%s%s" (Db.VM_appliance.get_uuid __context vm_appliance) (add_brackets name)
+		else
+			Ref.string_of vm_appliance
+		with _ -> "invalid"
+
 	let sr_uuid ~__context sr =
 		try if Pool_role.is_master () then
 			let name = Db.SR.get_name_label __context sr in
@@ -500,6 +508,34 @@ module Forward = functor(Local: Custom_actions.CUSTOM_ACTIONS) -> struct
 			Ref.string_of patch
 		with _ -> "invalid"
 
+	let pci_uuid ~__context pci =
+		try if Pool_role.is_master () then
+			Db.PCI.get_uuid __context pci
+		else
+			Ref.string_of pci
+		with _ -> "invalid"
+
+	let pgpu_uuid ~__context pgpu =
+		try if Pool_role.is_master () then
+			Db.PGPU.get_uuid __context pgpu
+		else
+			Ref.string_of pgpu
+		with _ -> "invalid"
+
+	let gpu_group_uuid ~__context gpu_group =
+		try if Pool_role.is_master () then
+			Db.GPU_group.get_uuid __context gpu_group
+		else
+			Ref.string_of gpu_group
+		with _ -> "invalid"
+
+	let vgpu_uuid ~__context vgpu =
+		try if Pool_role.is_master () then
+			Db.VGPU.get_uuid __context vgpu
+		else
+			Ref.string_of vgpu
+		with _ -> "invalid"
+
   module Session = Local.Session
   module Auth = Local.Auth
   module Subject = Local.Subject
@@ -507,6 +543,61 @@ module Forward = functor(Local: Custom_actions.CUSTOM_ACTIONS) -> struct
   module Task = Local.Task
   module Event = Local.Event
   module VMPP = Local.VMPP
+	module VM_appliance = struct
+		include Local.VM_appliance
+		(* Add to the VM_appliance's current operations, call a function and then remove from the *)
+		(* current operations. Ensure the allowed_operations are kept up to date. *)
+		let with_vm_appliance_operation ~__context ~self ~doc ~op f =
+			let task_id = Ref.string_of (Context.get_task_id __context) in
+			retry_with_global_lock ~__context ~doc
+				(fun () ->
+					Xapi_vm_appliance.assert_operation_valid ~__context ~self ~op;
+					Db.VM_appliance.add_to_current_operations ~__context ~self ~key:task_id ~value:op;
+					Xapi_vm_appliance.update_allowed_operations ~__context ~self);
+			(* Then do the action with the lock released *)
+			finally f
+				(* Make sure to clean up at the end *)
+				(fun () ->
+					try
+						Db.VM_appliance.remove_from_current_operations ~__context ~self ~key:task_id;
+						Xapi_vm_appliance.update_allowed_operations ~__context ~self;
+						Early_wakeup.broadcast (Datamodel._vm_appliance, Ref.string_of self);
+					with
+						_ -> ())
+
+		let start ~__context ~self ~paused =
+			info "VM_appliance.start: VM_appliance = '%s'" (vm_appliance_uuid ~__context self);
+			with_vm_appliance_operation ~__context ~self ~doc:"VM_appliance.start" ~op:`start
+				(fun () ->
+					Local.VM_appliance.start ~__context ~self ~paused)
+
+		let clean_shutdown ~__context ~self =
+			info "VM_appliance.clean_shutdown: VM_appliance = '%s'" (vm_appliance_uuid ~__context self);
+			with_vm_appliance_operation ~__context ~self ~doc:"VM_appliance.clean_shutdown" ~op:`clean_shutdown
+				(fun () ->
+					Local.VM_appliance.clean_shutdown ~__context ~self)
+
+		let hard_shutdown ~__context ~self =
+			info "VM_appliance.hard_shutdown: VM_appliance = '%s'" (vm_appliance_uuid ~__context self);
+			with_vm_appliance_operation ~__context ~self ~doc:"VM_appliance.hard_shutdown" ~op:`hard_shutdown
+				(fun () ->
+					Local.VM_appliance.hard_shutdown ~__context ~self)
+
+		let shutdown ~__context ~self =
+			info "VM_appliance.shutdown: VM_appliance = '%s'" (vm_appliance_uuid ~__context self);
+			with_vm_appliance_operation ~__context ~self ~doc:"VM_appliance.shutdown" ~op:`shutdown
+				(fun () ->
+					Local.VM_appliance.shutdown ~__context ~self)
+
+		let assert_can_be_recovered ~__context ~self ~session_to =
+			info "VM_appliance.assert_can_be_recovered: VM_appliance = '%s'" (vm_appliance_uuid ~__context self);
+			Local.VM_appliance.assert_can_be_recovered ~__context ~self ~session_to
+
+		let recover ~__context ~self ~session_to ~force =
+			info "VM_appliance.recover: VM_appliance = '%s'" (vm_appliance_uuid ~__context self);
+			Local.VM_appliance.recover ~__context ~self ~session_to ~force
+	end
+	module DR_task = Local.DR_task
   (* module Alert = Local.Alert *)
 
   module Pool = struct
@@ -837,24 +928,33 @@ module Forward = functor(Local: Custom_actions.CUSTOM_ACTIONS) -> struct
 			end;
 			raise exn
 
-    let forward_to_access_srs ~local_fn ~__context ~vm op =
-      let suitable_host = Xapi_vm_helpers.choose_host ~__context ~vm:vm ~choose_fn:(Xapi_vm_helpers.assert_can_see_SRs ~__context ~self:vm) () in
-	do_op_on ~local_fn ~__context ~host:suitable_host op
+	let forward_to_access_srs ~local_fn ~__context ~vm op =
+		let suitable_host =
+			Xapi_vm_helpers.choose_host ~__context ~vm
+				~choose_fn:(Xapi_vm_helpers.assert_can_see_SRs ~__context ~self:vm) () in
+		do_op_on ~local_fn ~__context ~host:suitable_host op
 
     (* Used for the VM.copy when an SR is specified *)
-    let forward_to_access_srs_and ~local_fn ~__context ~vm ~extra_sr op = 
-      let choose_fn ~host = 
-	Xapi_vm_helpers.assert_can_see_SRs ~__context ~self:vm ~host;
-	Xapi_vm_helpers.assert_can_see_specified_SRs ~__context ~reqd_srs:[extra_sr] ~host in
-      let suitable_host = Xapi_vm_helpers.choose_host ~__context ~vm ~choose_fn () in
-      do_op_on ~local_fn ~__context ~host:suitable_host op
+	let forward_to_access_srs_and ~local_fn ~__context ?vm ?extra_sr op = 
+		let choose_fn ~host =
+			begin match vm with
+			| Some vm ->
+				Xapi_vm_helpers.assert_can_see_SRs ~__context ~self:vm ~host
+			| _ -> () end;
+			begin match extra_sr with
+			| Some extra_sr ->
+				Xapi_vm_helpers.assert_can_see_specified_SRs ~__context
+					~reqd_srs:[extra_sr] ~host
+			| _ -> () end in
+		let suitable_host = Xapi_vm_helpers.choose_host ~__context ?vm ~choose_fn () in
+		do_op_on ~local_fn ~__context ~host:suitable_host op
 
     (* -------------------------------------------------------------------------- *)
 
     (* don't forward create. this just makes a db record *)
-    let create ~__context ~name_label ~name_description ~user_version ~is_a_template ~affinity ~memory_target ~memory_static_max ~memory_dynamic_max ~memory_dynamic_min ~memory_static_min ~vCPUs_params ~vCPUs_max ~vCPUs_at_startup ~actions_after_shutdown ~actions_after_reboot ~actions_after_crash ~pV_bootloader ~pV_kernel ~pV_ramdisk ~pV_args ~pV_bootloader_args ~pV_legacy_args ~hVM_boot_policy ~hVM_boot_params ~hVM_shadow_multiplier ~platform ~pCI_bus ~other_config ~recommendations ~xenstore_data  ~ha_always_run ~ha_restart_priority ~tags ~blocked_operations ~protection_policy =
+    let create ~__context ~name_label ~name_description ~user_version ~is_a_template ~affinity ~memory_target ~memory_static_max ~memory_dynamic_max ~memory_dynamic_min ~memory_static_min ~vCPUs_params ~vCPUs_max ~vCPUs_at_startup ~actions_after_shutdown ~actions_after_reboot ~actions_after_crash ~pV_bootloader ~pV_kernel ~pV_ramdisk ~pV_args ~pV_bootloader_args ~pV_legacy_args ~hVM_boot_policy ~hVM_boot_params ~hVM_shadow_multiplier ~platform ~pCI_bus ~other_config ~recommendations ~xenstore_data  ~ha_always_run ~ha_restart_priority ~tags ~blocked_operations ~protection_policy ~is_snapshot_from_vmpp ~appliance ~start_delay ~shutdown_delay ~order ~suspend_SR ~version =
       info "VM.create: name_label = '%s' name_description = '%s'" name_label name_description;
-      Local.VM.create ~__context ~name_label ~name_description ~user_version ~is_a_template ~affinity ~memory_target ~memory_static_max ~memory_dynamic_max ~memory_dynamic_min ~memory_static_min ~vCPUs_params ~vCPUs_max ~vCPUs_at_startup ~actions_after_shutdown ~actions_after_reboot ~actions_after_crash ~pV_bootloader ~pV_kernel ~pV_ramdisk ~pV_args ~pV_bootloader_args ~pV_legacy_args ~hVM_boot_policy ~hVM_boot_params ~hVM_shadow_multiplier ~platform ~pCI_bus ~other_config  ~recommendations ~xenstore_data  ~ha_always_run ~ha_restart_priority ~tags ~blocked_operations ~protection_policy
+      Local.VM.create ~__context ~name_label ~name_description ~user_version ~is_a_template ~affinity ~memory_target ~memory_static_max ~memory_dynamic_max ~memory_dynamic_min ~memory_static_min ~vCPUs_params ~vCPUs_max ~vCPUs_at_startup ~actions_after_shutdown ~actions_after_reboot ~actions_after_crash ~pV_bootloader ~pV_kernel ~pV_ramdisk ~pV_args ~pV_bootloader_args ~pV_legacy_args ~hVM_boot_policy ~hVM_boot_params ~hVM_shadow_multiplier ~platform ~pCI_bus ~other_config  ~recommendations ~xenstore_data  ~ha_always_run ~ha_restart_priority ~tags ~blocked_operations ~protection_policy ~is_snapshot_from_vmpp ~appliance ~start_delay ~shutdown_delay ~order ~suspend_SR ~version
 
     (* don't forward destroy. this just deletes db record *)
     let destroy ~__context ~self =
@@ -1700,6 +1800,36 @@ module Forward = functor(Local: Custom_actions.CUSTOM_ACTIONS) -> struct
 		info "VM.set_protection_policy: self = '%s'; " (vm_uuid ~__context self);
 		Local.VM.set_protection_policy ~__context ~self ~value
 
+	let set_start_delay ~__context ~self ~value =
+		info "VM.set_start_delay: self = '%s';" (vm_uuid ~__context self);
+		Local.VM.set_start_delay ~__context ~self ~value
+
+	let set_shutdown_delay ~__context ~self ~value =
+		info "VM.set_shutdown_delay: self = '%s';" (vm_uuid ~__context self);
+		Local.VM.set_shutdown_delay ~__context ~self ~value
+
+	let set_order ~__context ~self ~value =
+		info "VM.set_order: self = '%s';" (vm_uuid ~__context self);
+		Local.VM.set_order ~__context ~self ~value
+
+	let set_suspend_VDI ~__context ~self ~value =
+		info "VM.set_suspend_VDI: self = '%s';" (vm_uuid ~__context self);
+		Local.VM.set_suspend_VDI ~__context ~self ~value
+
+	let assert_can_be_recovered ~__context ~self ~session_to =
+		info "VM.assert_can_be_recovered: self = '%s';" (vm_uuid ~__context self);
+		Local.VM.assert_can_be_recovered ~__context ~self ~session_to
+
+	let recover ~__context ~self ~session_to ~force =
+		info "VM.recover: self = '%s'; force = %b;" (vm_uuid ~__context self) force;
+		(* If a VM is part of an appliance, the appliance *)
+		(* should be recovered using VM_appliance.recover *)
+		let appliance = Db.VM.get_appliance ~__context ~self in
+		if Db.is_valid_ref __context appliance then
+			raise (Api_errors.Server_error(Api_errors.vm_is_part_of_an_appliance,
+				[Ref.string_of self; Ref.string_of appliance]));
+		Local.VM.recover ~__context ~self ~session_to ~force
+
   end
 
   module VM_metrics = struct
@@ -2395,21 +2525,26 @@ end
 	end
 
   module Bond = struct
-    let create ~__context ~network ~members ~mAC = 
+    let create ~__context ~network ~members ~mAC ~mode =
       info "Bond.create: network = '%s'; members = [ %s ]"
-	(network_uuid ~__context network) (String.concat "; " (List.map (pif_uuid ~__context) members));
+        (network_uuid ~__context network) (String.concat "; " (List.map (pif_uuid ~__context) members));
       if List.length members = 0
       then raise (Api_errors.Server_error(Api_errors.pif_bond_needs_more_members, []));
       let host = Db.PIF.get_host ~__context ~self:(List.hd members) in
-      let local_fn = Local.Bond.create ~network ~members ~mAC in
-      do_op_on ~local_fn ~__context ~host (fun session_id rpc -> Client.Bond.create rpc session_id network members mAC)
-  
-    let destroy ~__context ~self = 
+      let local_fn = Local.Bond.create ~network ~members ~mAC ~mode in
+      do_op_on ~local_fn ~__context ~host (fun session_id rpc -> Client.Bond.create rpc session_id network members mAC mode)
+
+    let destroy ~__context ~self =
       info "Bond.destroy: bond = '%s'" (bond_uuid ~__context self);
       let host = Db.PIF.get_host ~__context ~self:(Db.Bond.get_master ~__context ~self) in
       let local_fn = Local.Bond.destroy ~self in
       do_op_on ~local_fn ~__context ~host (fun session_id rpc -> Client.Bond.destroy rpc session_id self)
-							
+
+    let set_mode ~__context ~self ~value =
+      info "Bond.destroy: bond = '%s'" (bond_uuid ~__context self);
+      let host = Db.PIF.get_host ~__context ~self:(Db.Bond.get_master ~__context ~self) in
+      let local_fn = Local.Bond.set_mode ~self ~value in
+      do_op_on ~local_fn ~__context ~host (fun session_id rpc -> Client.Bond.set_mode rpc session_id self value)
   end
 
   module PIF = struct
@@ -2642,11 +2777,34 @@ end
 	(fun session_id rpc -> Client.SR.probe ~rpc ~session_id ~host ~device_config ~_type ~sm_config)
 
     let set_shared ~__context ~sr ~value =
-      Local.SR.set_shared ~__context ~sr ~value
+	    Local.SR.set_shared ~__context ~sr ~value
+
+    let set_name_label ~__context ~sr ~value =
+	    info "SR.set_name_label: SR = '%s' name-label = '%s'"
+		    (sr_uuid ~__context sr) value;
+	    let local_fn = Local.SR.set_name_label ~sr ~value in
+	    forward_sr_op ~local_fn ~__context ~self:sr
+		    (fun session_id rpc -> Client.SR.set_name_label ~rpc ~session_id ~sr ~value)
+
+    let set_name_description ~__context ~sr ~value =
+	    info "SR.set_name_description: SR = '%s' name-description = '%s'"
+		    (sr_uuid ~__context sr) value;
+	    let local_fn = Local.SR.set_name_description ~sr ~value in
+	    forward_sr_op ~local_fn ~__context ~self:sr
+		    (fun session_id rpc ->
+			    Client.SR.set_name_description ~rpc ~session_id ~sr ~value)
 
     let assert_can_host_ha_statefile ~__context ~sr = 
       info "SR.assert_can_host_ha_statefile: SR = '%s'" (sr_uuid ~__context sr);
       Local.SR.assert_can_host_ha_statefile ~__context ~sr
+
+		let enable_database_replication ~__context ~sr =
+			info "SR.enable_database_replication: SR = '%s'" (sr_uuid ~__context sr);
+			Local.SR.enable_database_replication ~__context ~sr
+
+		let disable_database_replication ~__context ~sr =
+			info "SR.disable_database_replication: SR = '%s'" (sr_uuid ~__context sr);
+			Local.SR.disable_database_replication ~__context ~sr
 
     let create_new_blob ~__context ~sr ~name ~mime_type =
       info "SR.create_new_blob: SR = '%s'" (sr_uuid ~__context sr);
@@ -2736,6 +2894,31 @@ end
       Sm.assert_session_has_internal_sr_access ~__context ~sr;
       Local.VDI.set_physical_utilisation ~__context ~self ~value
 
+		let set_is_a_snapshot ~__context ~self ~value =
+			let sr = Db.VDI.get_SR ~__context ~self in
+			Sm.assert_session_has_internal_sr_access ~__context ~sr;
+			Local.VDI.set_is_a_snapshot ~__context ~self ~value
+
+		let set_snapshot_of ~__context ~self ~value =
+			let sr = Db.VDI.get_SR ~__context ~self in
+			Sm.assert_session_has_internal_sr_access ~__context ~sr;
+			Local.VDI.set_snapshot_of ~__context ~self ~value
+
+    let set_name_label ~__context ~self ~value =
+	    info "VDI.set_name_label: VDI = '%s' name-label = '%s'"
+		    (vdi_uuid ~__context self) value;
+	    let local_fn = Local.VDI.set_name_label ~self ~value in
+	    forward_vdi_op ~local_fn ~__context ~self
+		    (fun session_id rpc -> Client.VDI.set_name_label ~rpc ~session_id ~self ~value)
+
+    let set_name_description ~__context ~self ~value =
+	    info "VDI.set_name_description: VDI = '%s' name-description = '%s'"
+		    (vdi_uuid ~__context self) value;
+	    let local_fn = Local.VDI.set_name_description ~self ~value in
+	    forward_vdi_op ~local_fn ~__context ~self
+		    (fun session_id rpc ->
+			    Client.VDI.set_name_description ~rpc ~session_id ~self ~value)
+
 	let ensure_vdi_not_on_running_vm ~__context ~self =
 		let vbds = Db.VDI.get_VBDs ~__context ~self in
 		List.iter (fun vbd ->
@@ -2753,6 +2936,12 @@ end
 	let set_allow_caching ~__context ~self ~value =
 		ensure_vdi_not_on_running_vm ~__context ~self;
 		Local.VDI.set_allow_caching ~__context ~self ~value
+
+	let open_database ~__context ~self =
+		Local.VDI.open_database ~__context ~self
+
+	let read_database_pool_uuid ~__context ~self =
+		Local.VDI.read_database_pool_uuid ~__context ~self
 
     (* know sr so just use SR forwarding policy direct here *)
     let create ~__context ~name_label ~name_description ~sR ~virtual_size ~_type ~sharable ~read_only ~other_config ~xenstore_data ~sm_config ~tags =
@@ -2872,7 +3061,12 @@ end
       with_sr_andor_vdi ~__context ~vdi:(vdi, `force_unlock) ~doc:"VDI.force_unlock"
 	(fun () ->
 	   forward_vdi_op ~local_fn ~__context ~self:vdi
-	     (fun session_id rpc -> Client.VDI.force_unlock rpc session_id vdi))
+		   (fun session_id rpc -> Client.VDI.force_unlock rpc session_id vdi))
+
+    let checksum ~__context ~self =
+			VM.forward_to_access_srs_and ~local_fn:(Local.VDI.checksum ~self) ~__context
+				~extra_sr:(Db.VDI.get_SR ~__context ~self)
+				(fun session_id rpc -> Client.VDI.checksum rpc session_id self)
 
   end
   module VBD = struct
@@ -2896,7 +3090,7 @@ end
 			Xapi_vbd_helpers.update_allowed_operations ~__context ~self;
 			Early_wakeup.broadcast (Datamodel._vbd, Ref.string_of vbd)
 		end)
-	vbd      
+	vbd
 
     let mark_vbd ~__context ~vbd ~doc ~op = 
       let task_id = Ref.string_of (Context.get_task_id __context) in      
@@ -3130,4 +3324,32 @@ end
   module Data_source = struct end
 
 	module Secret = Local.Secret
+
+	module PCI = struct end
+
+	module PGPU = struct end
+
+	module GPU_group = struct
+		(* Don't forward. These are just db operations. *)
+		let create ~__context ~name_label ~name_description ~other_config =
+			info "GPU_group.create: name_label = '%s'" name_label;
+			Local.GPU_group.create ~__context ~name_label ~name_description ~other_config
+
+		let destroy ~__context ~self =
+			info "GPU_group.destroy: gpu_group = '%s'" (gpu_group_uuid ~__context self);
+			(* WARNING WARNING WARNING: directly call destroy with the global lock since it does only database operations *)
+			with_global_lock (fun () ->
+				Local.GPU_group.destroy ~__context ~self)
+	end
+
+	module VGPU = struct
+		let create ~__context ~vM ~gPU_group ~device ~other_config =
+			info "VGPU.create: VM = '%s'; GPU_group = '%s'" (vm_uuid ~__context vM) (gpu_group_uuid ~__context gPU_group);
+			Local.VGPU.create ~__context ~vM ~gPU_group ~device ~other_config
+
+		let destroy ~__context ~self =
+			info "VGPU.destroy: VIF = '%s'" (vgpu_uuid ~__context self);
+			Local.VGPU.destroy ~__context ~self
+	end
 end
+

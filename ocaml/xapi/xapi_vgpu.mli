@@ -1,5 +1,5 @@
 (*
- * Copyright (C) 2006-2009 Citrix Systems Inc.
+ * Copyright (C) 2006-2011 Citrix Systems Inc.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU Lesser General Public License as published
@@ -11,19 +11,21 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU Lesser General Public License for more details.
  *)
-type t
+(** Module that defines API functions for VGPU objects
+ * @group Graphics
+ *)
 
-val make : Xc.domid -> nativeint -> int -> Mmap.mmap_interface -> Event.t -> t
-val close : t -> unit
+(** Create a VGPU. *)
+val create :
+  __context:Context.t ->
+  vM:[ `VM ] Ref.t ->
+  gPU_group:[ `GPU_group ] Ref.t ->
+  device:string -> other_config:(string * string) list -> [ `VGPU ] Ref.t
 
-val get_path : t -> string
-val get_id : t -> Xc.domid
-val get_interface : t -> Mmap.mmap_interface
-val get_mfn : t -> nativeint
-val get_remote_port : t -> int
+(** Destroy a VGPU. *)
+val destroy : __context:Context.t -> self:[ `VGPU ] Ref.t -> unit
 
-val dump : t -> out_channel -> unit
-
-val notify : t -> unit
-val bind_interdomain : t -> unit
-val is_dom0 : t -> bool
+(** Duplicate a VGPU. *)
+val copy :
+  __context:Context.t ->
+  vm:[ `VM ] Ref.t -> [ `VGPU ] Ref.t -> [ `VGPU ] Ref.t

@@ -18,6 +18,7 @@
 open Stringext
 open Printf
 open Xapi_vm_memory_constraints
+open Listext
 
 module D=Debug.Debugger(struct let name="xapi" end)
 open D
@@ -99,7 +100,8 @@ let set_is_a_template ~__context ~self ~value =
 	Db.VM.set_is_a_template ~__context ~self ~value
 
 let create ~__context ~name_label ~name_description
-           ~user_version ~is_a_template ~affinity
+           ~user_version ~is_a_template
+           ~affinity
            ~memory_target
            ~memory_static_max
            ~memory_dynamic_max
@@ -117,6 +119,12 @@ let create ~__context ~name_label ~name_description
 	   ~ha_always_run ~ha_restart_priority ~tags 
 	   ~blocked_operations ~protection_policy
      ~is_snapshot_from_vmpp
+		 ~appliance
+		 ~start_delay
+		 ~shutdown_delay
+		 ~order
+		 ~suspend_SR 
+		 ~version
 	   : API.ref_VM =
 
 	(* NB parameter validation is delayed until VM.start *)
@@ -177,9 +185,15 @@ let create ~__context ~name_label ~name_description
 		~ha_restart_priority
 		~ha_always_run ~tags
 		~bios_strings:[]
-    ~protection_policy:Ref.null
-    ~is_snapshot_from_vmpp:false 
-    ;
+		~protection_policy:Ref.null
+		~is_snapshot_from_vmpp:false 
+		~appliance
+		~start_delay
+		~shutdown_delay
+		~order
+		~suspend_SR
+		~version
+		;
 	Db.VM.set_power_state ~__context ~self:vm_ref ~value:`Halted;
 	Xapi_vm_lifecycle.update_allowed_operations ~__context ~self:vm_ref;
 	update_memory_overhead ~__context ~vm:vm_ref;
@@ -209,6 +223,10 @@ let destroy  ~__context ~self =
 		    let metrics = Db.VIF.get_metrics ~__context ~self:vif in
 		    Db.VIF_metrics.destroy ~__context ~self:metrics with _ -> ());
 		 (try Db.VIF.destroy ~__context ~self:vif with _ -> ())) vifs;
+  let vgpus = Db.VM.get_VGPUs ~__context ~self in
+  List.iter (fun vgpu -> try Db.VGPU.destroy ~__context ~self:vgpu with _ -> ()) vgpus;
+  let pcis = Db.VM.get_attached_PCIs ~__context ~self in
+  List.iter (fun pci -> try Db.PCI.remove_attached_VMs ~__context ~self:pci ~value:self with _ -> ()) pcis;
    let vm_metrics = Db.VM.get_metrics ~__context ~self in
      (try Db.VM_metrics.destroy ~__context ~self:vm_metrics with _ -> ());
    let vm_guest_metrics = Db.VM.get_guest_metrics ~__context ~self in
@@ -280,6 +298,48 @@ let assert_host_is_live ~__context ~host =
 	let host_is_live = is_host_live ~__context host in
 	if not host_is_live then
 		raise (Api_errors.Server_error (Api_errors.host_not_live, []))
+
+(* Currently, this check assumes that IOMMU (VT-d) is required iff the host
+ * has a vGPU. This will likely need to be modified in future. *)
+let vm_needs_iommu ~__context ~self =
+	Db.VM.get_VGPUs ~__context ~self <> []
+
+let assert_host_has_iommu ~__context ~host =
+	let chipset_info = Db.Host.get_chipset_info ~__context ~self:host in
+	if List.assoc "iommu" chipset_info <> "true" then
+		raise (Api_errors.Server_error (Api_errors.vm_requires_iommu, [Ref.string_of host]))
+
+let assert_gpus_available ~__context ~self ~host =
+	let vgpus = Db.VM.get_VGPUs ~__context ~self in
+	let reqd_groups =
+		List.map (fun self -> Db.VGPU.get_GPU_group ~__context ~self) vgpus in
+	let is_pgpu_available pgpu =
+		let pci = Db.PGPU.get_PCI ~__context ~self:pgpu in
+		let attached = List.length (Db.PCI.get_attached_VMs ~__context ~self:pci) in
+		let functions = Int64.to_int (Db.PCI.get_functions ~__context ~self:pci) in
+		attached < functions
+	in
+	let is_group_available_on host group =
+		let pgpus = Db.GPU_group.get_PGPUs ~__context ~self:group in
+		let avail_pgpus = List.filter is_pgpu_available pgpus in
+		let hosts = List.map (fun self -> Db.PGPU.get_host ~__context ~self) avail_pgpus in
+		List.mem host hosts
+	in
+	let avail_groups = List.filter (is_group_available_on host) reqd_groups in
+	let not_available = set_difference reqd_groups avail_groups in
+
+	List.iter
+		(fun group -> warn "Host %s does not have a pGPU from group %s available"
+			(Helpers.checknull
+				(fun () -> Db.Host.get_name_label ~__context ~self:host))
+			(Helpers.checknull
+				(fun () -> Db.GPU_group.get_name_label ~__context ~self:group)))
+		not_available;
+	if not_available <> [] then
+		raise (Api_errors.Server_error (Api_errors.vm_requires_gpu, [
+			Ref.string_of self;
+			Ref.string_of (List.hd not_available)
+		]))
 
 (* We only check if a VM can boot here w.r.t. the configuration snapshot. If
  * the database is modified in parallel then this check will be inaccurate.
@@ -364,10 +424,8 @@ let assert_can_boot_here_common
 			Ref.string_of (List.hd not_available)
 		]));
 
-	(* Also, for each of the available networks, we need to ensure that host  *)
-	(* can bring it up on the specified host; i.e. it doesn't shaft a network *)
-	(* on that host (i.e. one that's attached to an enslaved PIF) that we     *)
-	(* currently require. *)
+	(* Also, for each of the available networks, we need to ensure that we can bring it
+	 * up on the specified host; i.e. it doesn't need an enslaved PIF. *)
 	List.iter
 		(fun network->
 			try
@@ -375,8 +433,7 @@ let assert_can_boot_here_common
 					(Xapi_network_attach_helpers.assert_can_attach_network_on_host
 						~__context
 						~self:network
-						~host
-						~overide_management_if_check:false)
+						~host)
 					(* throw exception more appropriate to this context: *)
 			with exn ->
 				debug
@@ -389,6 +446,11 @@ let assert_can_boot_here_common
 						Ref.string_of host; Ref.string_of network ]))
 		)
 		avail_nets;
+
+	if vm_needs_iommu ~__context ~self then
+		assert_host_has_iommu ~__context ~host;
+
+	assert_gpus_available ~__context ~self ~host;
 
 	(* Check if the VM would boot HVM and the target machine is HVM-capable *)
 	let hvm = Helpers.will_boot_hvm ~__context ~self in
@@ -916,3 +978,72 @@ let copy_guest_metrics ~__context ~vm =
 		ref
 	with _ ->
 		Ref.null
+
+(* Populate last_boot_CPU_flags with the vendor and feature set of the given host's CPU. *)
+let populate_cpu_flags ~__context ~vm ~host =
+	let add_or_replace (key, value) values =
+		if List.mem_assoc key values then
+			List.replace_assoc key value values
+		else
+			(key, value) :: values
+	in
+	let cpu_info = Db.Host.get_cpu_info ~__context ~self:host in
+	let flags = ref (Db.VM.get_last_boot_CPU_flags ~__context ~self:vm) in
+	if List.mem_assoc "vendor" cpu_info then
+		flags := add_or_replace ("vendor", List.assoc "vendor" cpu_info) !flags;
+	if List.mem_assoc "features" cpu_info then
+		flags := add_or_replace ("features", List.assoc "features" cpu_info) !flags;
+	Db.VM.set_last_boot_CPU_flags ~__context ~self:vm ~value:!flags
+
+let assert_vm_is_compatible ~__context ~vm ~host =
+	let host_cpu_info = Db.Host.get_cpu_info ~__context ~self:host in
+	let vm_cpu_info = Db.VM.get_last_boot_CPU_flags ~__context ~self:vm in
+	if List.mem_assoc "vendor" vm_cpu_info then begin
+		(* Check the VM was last booted on a CPU with the same vendor as this host's CPU. *)
+		if (List.assoc "vendor" vm_cpu_info) <> (List.assoc "vendor" host_cpu_info) then
+			raise (Api_errors.Server_error(Api_errors.vm_incompatible_with_this_host,
+				[Ref.string_of vm; Ref.string_of host; "VM was last booted on a host which had a CPU from a different vendor."]))
+	end;
+	if List.mem_assoc "features" vm_cpu_info then begin
+		(* Check the VM was last booted on a CPU whose features are a subset of the features of this host's CPU. *)
+		let host_cpu_features = Cpuid.string_to_features (List.assoc "features" host_cpu_info) in
+		let vm_cpu_features = Cpuid.string_to_features (List.assoc "features" vm_cpu_info) in
+		if not((Cpuid.mask_features host_cpu_features vm_cpu_features) = vm_cpu_features) then
+			raise (Api_errors.Server_error(Api_errors.vm_incompatible_with_this_host,
+				[Ref.string_of vm; Ref.string_of host; "VM was last booted on a CPU with features this host's CPU does not have."]))
+	end
+
+let list_required_vdis ~__context ~self =
+	let vbds = Db.VM.get_VBDs ~__context ~self in
+	let vbds_excluding_cd =
+		List.filter (fun vbd -> Db.VBD.get_type ~__context ~self:vbd <> `CD) vbds
+	in
+	List.map (fun vbd -> Db.VBD.get_VDI ~__context ~self:vbd) vbds_excluding_cd
+
+(* Find the SRs of all VDIs which have VBDs attached to the VM. *)
+let list_required_SRs ~__context ~self =
+	let vdis = list_required_vdis ~__context ~self in
+	let srs = List.map (fun vdi -> Db.VDI.get_SR ~__context ~self:vdi) vdis in
+	let srs = List.filter (fun sr -> Db.SR.get_content_type ~__context ~self:sr <> "iso") srs in
+	List.setify srs
+
+(* Check if the database referenced by session_to *)
+(* contains the SRs required to recover the VM. *)
+let assert_can_be_recovered ~__context ~self ~session_to =
+	(* Get the required SR uuids from the foreign database. *)
+	let required_SRs = list_required_SRs ~__context ~self in
+	let required_SR_uuids = List.map (fun sr -> Db.SR.get_uuid ~__context ~self:sr)
+		required_SRs
+	in
+	(* Try to look up the SRs by uuid in the local database. *)
+	try
+		Server_helpers.exec_with_new_task ~session_id:session_to
+			"Looking for required SRs"
+			(fun __context -> List.iter
+				(fun sr_uuid -> ignore (Db.SR.get_by_uuid ~__context ~uuid:sr_uuid))
+				required_SR_uuids)
+	with Db_exn.Read_missing_uuid(_, _, sr_uuid) ->
+		(* Throw exception containing the uuid of the first SR which wasn't found. *)
+		let sr_ref = Db.SR.get_by_uuid ~__context ~uuid:sr_uuid in
+		raise (Api_errors.Server_error(Api_errors.vm_requires_sr,
+			[Ref.string_of self; Ref.string_of sr_ref]))

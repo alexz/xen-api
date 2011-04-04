@@ -109,6 +109,7 @@ XAPI_MODULES = $(COMMON) \
 	xapi_subject \
 	audit_log \
 	xapi_vmpp \
+	xapi_vm_appliance \
 	xapi_vm_lifecycle \
 	xapi_vm_clone \
 	xapi_vm_snapshot \
@@ -138,6 +139,8 @@ XAPI_MODULES = $(COMMON) \
 	vmopshelpers \
 	vm_config \
 	vmops \
+	pciops \
+	vgpuops \
 	memory_control \
 	vbdops \
 	attach_helpers \
@@ -211,6 +214,8 @@ XAPI_MODULES = $(COMMON) \
 	xapi_host_cpu \
 	xapi_task \
 	xapi_vm_migrate \
+	xapi_dr \
+	xapi_dr_task \
 	mtc \
 	xapi_crashdump \
 	xapi_templates_install \
@@ -239,7 +244,11 @@ XAPI_MODULES = $(COMMON) \
 	xapi_config \
 	features \
 	pool_features \
-	../license/license_init
+	../license/license_init \
+	xapi_pci \
+	xapi_pgpu \
+	xapi_gpu_group \
+	xapi_vgpu
 
 OCamlProgram(xapi, xapi $(XAPI_MODULES))
 OCamlDocProgram(xapi, xapi $(XAPI_MODULES))
